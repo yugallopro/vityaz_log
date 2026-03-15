@@ -121,16 +121,46 @@ void sendHTTP(int sock, const std::string& ctype, const std::string& body) {
     send(sock, resp.c_str(), resp.size(), 0);
 }
 
+// Legge TUTTA la richiesta HTTP rispettando Content-Length
+std::string readFullRequest(int sock) {
+    std::string req;
+    char buf[4096];
+    // Leggi finché non troviamo \r\n\r\n (fine header)
+    while (req.find("\r\n\r\n") == std::string::npos) {
+        int n = recv(sock, buf, sizeof(buf)-1, 0);
+        if (n <= 0) break;
+        buf[n] = 0;
+        req += std::string(buf, n);
+    }
+    // Ora leggi il body in base a Content-Length
+    size_t headerEnd = req.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) return req;
+    
+    int contentLength = 0;
+    size_t clPos = req.find("Content-Length: ");
+    if (clPos != std::string::npos) {
+        clPos += 16;
+        contentLength = atoi(req.substr(clPos).c_str());
+    }
+    
+    std::string body = req.substr(headerEnd + 4);
+    // Leggi i byte mancanti del body
+    while ((int)body.size() < contentLength) {
+        int toRead = contentLength - (int)body.size();
+        int n = recv(sock, buf, std::min(toRead, (int)sizeof(buf)-1), 0);
+        if (n <= 0) break;
+        body += std::string(buf, n);
+    }
+    return req.substr(0, headerEnd + 4) + body;
+}
+
 void handleHTTP(int sock) {
-    char buf[8192] = {};
-    recv(sock, buf, sizeof(buf)-1, 0);
-    std::string req(buf);
+    std::string req = readFullRequest(sock);
 
     std::string method, fullpath;
     std::istringstream ss(req);
     ss >> method >> fullpath;
 
-    // Separa path e query string
     std::string path, query;
     size_t q = fullpath.find('?');
     if (q != std::string::npos) {
@@ -140,7 +170,6 @@ void handleHTTP(int sock) {
         path = fullpath;
     }
 
-    // Body POST
     std::string body;
     size_t bodyPos = req.find("\r\n\r\n");
     if (bodyPos != std::string::npos)
@@ -156,7 +185,6 @@ void handleHTTP(int sock) {
         sendHTTP(sock, "application/json", buildJSON(last));
 
     } else if (path == "/send" && method == "POST") {
-        // Accetta key sia dall'URL che dal body
         std::string key  = getParam(query, "key");
         if (key.empty()) key = getParam(body, "key");
         std::string riga = getParam(body, "riga");
