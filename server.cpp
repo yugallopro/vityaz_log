@@ -10,14 +10,11 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <fcntl.h>
 
-#define PASSWORD   "vityaz2024"
-#define TCP_PORT   9000   // client C++ si connette qui
-#define HTTP_PORT  8080   // browser si connette qui (Render usa PORT env)
+#define PASSWORD "vityaz2024"
 
 std::mutex g_mutex;
-std::vector<std::string> g_log; // tutte le righe ricevute
+std::vector<std::string> g_log;
 
 std::string timestamp() {
     time_t now = time(0);
@@ -27,53 +24,34 @@ std::string timestamp() {
     return std::string(buf);
 }
 
-void sendStr(int s, const std::string& msg) {
-    std::string out = msg + "\n";
-    send(s, out.c_str(), out.size(), 0);
-}
-
-std::string readLine(int s) {
-    std::string result;
-    char c;
-    while (recv(s, &c, 1, 0) == 1) {
-        if (c == '\n') break;
-        if (c != '\r') result += c;
-    }
-    return result;
-}
-
-// ── Thread che gestisce il client C++ ───────────────────────────
-void handleClient(int sock) {
-    // Autenticazione
-    std::string pass = readLine(sock);
-    if (pass != PASSWORD) {
-        sendStr(sock, "NEGATO");
-        close(sock);
-        return;
-    }
-    sendStr(sock, "OK");
-    std::cout << timestamp() << " Client connesso\n";
-
-    while (true) {
-        std::string riga = readLine(sock);
-        if (riga.empty()) break;
-
-        std::string entry = timestamp() + " " + riga;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_log.push_back(entry);
-            // Tieni al massimo 500 righe
-            if (g_log.size() > 500) g_log.erase(g_log.begin());
+// Decode URL encoding
+std::string urlDecode(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i+2 < s.size()) {
+            int c = strtol(s.substr(i+1,2).c_str(), nullptr, 16);
+            out += (char)c; i += 2;
+        } else if (s[i] == '+') {
+            out += ' ';
+        } else {
+            out += s[i];
         }
-        std::cout << entry << "\n";
-        sendStr(sock, "OK");
     }
-
-    std::cout << timestamp() << " Client disconnesso\n";
-    close(sock);
+    return out;
 }
 
-// ── Genera la pagina HTML con SSE ────────────────────────────────
+// Estrai valore da body POST: key=val&key2=val2
+std::string getParam(const std::string& body, const std::string& key) {
+    std::string search = key + "=";
+    size_t pos = body.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.size();
+    size_t end = body.find('&', pos);
+    return urlDecode(end == std::string::npos
+        ? body.substr(pos)
+        : body.substr(pos, end - pos));
+}
+
 std::string buildHTML() {
     return R"(<!DOCTYPE html>
 <html lang="it">
@@ -107,7 +85,7 @@ function poll() {
         setTimeout(poll, 2000);
     })
     .catch(function() {
-        document.getElementById('stato').textContent = 'Errore connessione, riprovo...';
+        document.getElementById('stato').textContent = 'Riconnessione...';
         setTimeout(poll, 3000);
     });
 }
@@ -117,7 +95,6 @@ poll();
 </html>)";
 }
 
-// ── Genera JSON con le righe nuove ───────────────────────────────
 std::string buildJSON(int lastSeen) {
     std::lock_guard<std::mutex> lock(g_mutex);
     std::ostringstream oss;
@@ -125,13 +102,11 @@ std::string buildJSON(int lastSeen) {
     bool first = true;
     for (int i = lastSeen; i < (int)g_log.size(); i++) {
         if (!first) oss << ",";
-        // Escape base per JSON
-        std::string s = g_log[i];
         std::string escaped;
-        for (char c : s) {
-            if (c == '"') escaped += "\\\"";
-            else if (c == '\\') escaped += "\\\\";
-            else escaped += c;
+        for (char c : g_log[i]) {
+            if (c=='"') escaped+="\\\"";
+            else if (c=='\\') escaped+="\\\\";
+            else escaped+=c;
         }
         oss << "\"" << escaped << "\"";
         first = false;
@@ -140,92 +115,94 @@ std::string buildJSON(int lastSeen) {
     return oss.str();
 }
 
-// ── Thread HTTP per il browser ───────────────────────────────────
+void sendHTTP(int sock, int code, const std::string& ctype, const std::string& body) {
+    std::string status = (code==200) ? "200 OK" : "404 Not Found";
+    std::ostringstream r;
+    r << "HTTP/1.1 " << status << "\r\n"
+      << "Content-Type: " << ctype << "\r\n"
+      << "Content-Length: " << body.size() << "\r\n"
+      << "Access-Control-Allow-Origin: *\r\n"
+      << "Connection: close\r\n\r\n"
+      << body;
+    std::string resp = r.str();
+    send(sock, resp.c_str(), resp.size(), 0);
+}
+
 void handleHTTP(int sock) {
-    char buf[4096] = {};
-    recv(sock, buf, sizeof(buf)-1, 0);
-    std::string req(buf);
+    // Leggi tutta la richiesta
+    std::string req;
+    char buf[8192] = {};
+    int n = recv(sock, buf, sizeof(buf)-1, 0);
+    if (n > 0) req = std::string(buf, n);
 
-    // Leggi il path dalla prima riga HTTP
-    std::string path = "/";
-    size_t get = req.find("GET ");
-    if (get != std::string::npos) {
-        size_t start = get + 4;
-        size_t end   = req.find(' ', start);
-        path = req.substr(start, end - start);
-    }
+    // Estrai metodo e path
+    std::string method, path;
+    std::istringstream ss(req);
+    ss >> method >> path;
 
-    std::string body, ctype;
+    // Estrai body (dopo \r\n\r\n)
+    std::string body;
+    size_t bodyPos = req.find("\r\n\r\n");
+    if (bodyPos != std::string::npos)
+        body = req.substr(bodyPos + 4);
+
     if (path == "/" || path == "/index.html") {
-        body  = buildHTML();
-        ctype = "text/html; charset=UTF-8";
+        sendHTTP(sock, 200, "text/html; charset=UTF-8", buildHTML());
+
     } else if (path.find("/data") == 0) {
         int last = 0;
         size_t q = path.find("last=");
         if (q != std::string::npos) last = atoi(path.c_str() + q + 5);
-        body  = buildJSON(last);
-        ctype = "application/json";
+        sendHTTP(sock, 200, "application/json", buildJSON(last));
+
+    } else if (path == "/send" && method == "POST") {
+        std::string key  = getParam(body, "key");
+        std::string riga = getParam(body, "riga");
+
+        if (key != PASSWORD) {
+            sendHTTP(sock, 200, "application/json", "{\"status\":\"error\",\"msg\":\"password errata\"}");
+        } else if (riga.empty()) {
+            sendHTTP(sock, 200, "application/json", "{\"status\":\"error\",\"msg\":\"riga vuota\"}");
+        } else {
+            std::string entry = timestamp() + " " + riga;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_log.push_back(entry);
+                if (g_log.size() > 500) g_log.erase(g_log.begin());
+            }
+            std::cout << entry << "\n";
+            sendHTTP(sock, 200, "application/json", "{\"status\":\"ok\"}");
+        }
+
     } else {
-        body  = "Not found";
-        ctype = "text/plain";
+        sendHTTP(sock, 404, "text/plain", "Not found");
     }
 
-    std::ostringstream resp;
-    resp << "HTTP/1.1 200 OK\r\n"
-         << "Content-Type: " << ctype << "\r\n"
-         << "Content-Length: " << body.size() << "\r\n"
-         << "Access-Control-Allow-Origin: *\r\n"
-         << "Connection: close\r\n\r\n"
-         << body;
-    std::string r = resp.str();
-    send(sock, r.c_str(), r.size(), 0);
     close(sock);
 }
 
-void tcpServer() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(TCP_PORT);
-    bind(fd, (sockaddr*)&addr, sizeof(addr));
-    listen(fd, 4);
-    std::cout << "TCP in ascolto sulla porta " << TCP_PORT << "\n";
-    while (true) {
-        int client = accept(fd, NULL, NULL);
-        if (client >= 0)
-            std::thread(handleClient, client).detach();
-    }
-}
-
-void httpServer() {
-    // Render passa la porta via env PORT
-    int port = HTTP_PORT;
+int main() {
+    int port = 8080;
     const char* envPort = getenv("PORT");
     if (envPort) port = atoi(envPort);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(port);
     bind(fd, (sockaddr*)&addr, sizeof(addr));
-    listen(fd, 16);
-    std::cout << "HTTP in ascolto sulla porta " << port << "\n";
+    listen(fd, 32);
+
+    std::cout << "=== Vityaz Server HTTP sulla porta " << port << " ===\n";
+
     while (true) {
         int client = accept(fd, NULL, NULL);
         if (client >= 0)
             std::thread(handleHTTP, client).detach();
     }
-}
-
-int main() {
-    std::cout << "=== Vityaz Server ===\n";
-    std::thread(tcpServer).detach();
-    httpServer(); // blocca qui
     return 0;
 }
