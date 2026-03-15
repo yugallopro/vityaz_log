@@ -24,32 +24,26 @@ std::string timestamp() {
     return std::string(buf);
 }
 
-// Decode URL encoding
 std::string urlDecode(const std::string& s) {
     std::string out;
     for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] == '%' && i+2 < s.size()) {
+        if (s[i]=='%' && i+2 < s.size()) {
             int c = strtol(s.substr(i+1,2).c_str(), nullptr, 16);
             out += (char)c; i += 2;
-        } else if (s[i] == '+') {
-            out += ' ';
-        } else {
-            out += s[i];
-        }
+        } else if (s[i]=='+') out += ' ';
+        else out += s[i];
     }
     return out;
 }
 
-// Estrai valore da body POST: key=val&key2=val2
-std::string getParam(const std::string& body, const std::string& key) {
+std::string getParam(const std::string& src, const std::string& key) {
     std::string search = key + "=";
-    size_t pos = body.find(search);
+    size_t pos = src.find(search);
     if (pos == std::string::npos) return "";
     pos += search.size();
-    size_t end = body.find('&', pos);
+    size_t end = src.find('&', pos);
     return urlDecode(end == std::string::npos
-        ? body.substr(pos)
-        : body.substr(pos, end - pos));
+        ? src.substr(pos) : src.substr(pos, end-pos));
 }
 
 std::string buildHTML() {
@@ -115,10 +109,9 @@ std::string buildJSON(int lastSeen) {
     return oss.str();
 }
 
-void sendHTTP(int sock, int code, const std::string& ctype, const std::string& body) {
-    std::string status = (code==200) ? "200 OK" : "404 Not Found";
+void sendHTTP(int sock, const std::string& ctype, const std::string& body) {
     std::ostringstream r;
-    r << "HTTP/1.1 " << status << "\r\n"
+    r << "HTTP/1.1 200 OK\r\n"
       << "Content-Type: " << ctype << "\r\n"
       << "Content-Length: " << body.size() << "\r\n"
       << "Access-Control-Allow-Origin: *\r\n"
@@ -129,40 +122,49 @@ void sendHTTP(int sock, int code, const std::string& ctype, const std::string& b
 }
 
 void handleHTTP(int sock) {
-    // Leggi tutta la richiesta
-    std::string req;
     char buf[8192] = {};
-    int n = recv(sock, buf, sizeof(buf)-1, 0);
-    if (n > 0) req = std::string(buf, n);
+    recv(sock, buf, sizeof(buf)-1, 0);
+    std::string req(buf);
 
-    // Estrai metodo e path
-    std::string method, path;
+    std::string method, fullpath;
     std::istringstream ss(req);
-    ss >> method >> path;
+    ss >> method >> fullpath;
 
-    // Estrai body (dopo \r\n\r\n)
+    // Separa path e query string
+    std::string path, query;
+    size_t q = fullpath.find('?');
+    if (q != std::string::npos) {
+        path  = fullpath.substr(0, q);
+        query = fullpath.substr(q+1);
+    } else {
+        path = fullpath;
+    }
+
+    // Body POST
     std::string body;
     size_t bodyPos = req.find("\r\n\r\n");
     if (bodyPos != std::string::npos)
         body = req.substr(bodyPos + 4);
 
     if (path == "/" || path == "/index.html") {
-        sendHTTP(sock, 200, "text/html; charset=UTF-8", buildHTML());
+        sendHTTP(sock, "text/html; charset=UTF-8", buildHTML());
 
-    } else if (path.find("/data") == 0) {
+    } else if (path == "/data") {
         int last = 0;
-        size_t q = path.find("last=");
-        if (q != std::string::npos) last = atoi(path.c_str() + q + 5);
-        sendHTTP(sock, 200, "application/json", buildJSON(last));
+        std::string lv = getParam(query, "last");
+        if (!lv.empty()) last = atoi(lv.c_str());
+        sendHTTP(sock, "application/json", buildJSON(last));
 
     } else if (path == "/send" && method == "POST") {
-        std::string key  = getParam(body, "key");
+        // Accetta key sia dall'URL che dal body
+        std::string key  = getParam(query, "key");
+        if (key.empty()) key = getParam(body, "key");
         std::string riga = getParam(body, "riga");
 
         if (key != PASSWORD) {
-            sendHTTP(sock, 200, "application/json", "{\"status\":\"error\",\"msg\":\"password errata\"}");
+            sendHTTP(sock, "application/json", "{\"status\":\"error\",\"msg\":\"password errata\"}");
         } else if (riga.empty()) {
-            sendHTTP(sock, 200, "application/json", "{\"status\":\"error\",\"msg\":\"riga vuota\"}");
+            sendHTTP(sock, "application/json", "{\"status\":\"error\",\"msg\":\"riga vuota\"}");
         } else {
             std::string entry = timestamp() + " " + riga;
             {
@@ -171,13 +173,11 @@ void handleHTTP(int sock) {
                 if (g_log.size() > 500) g_log.erase(g_log.begin());
             }
             std::cout << entry << "\n";
-            sendHTTP(sock, 200, "application/json", "{\"status\":\"ok\"}");
+            sendHTTP(sock, "application/json", "{\"status\":\"ok\"}");
         }
-
     } else {
-        sendHTTP(sock, 404, "text/plain", "Not found");
+        sendHTTP(sock, "text/plain", "Not found");
     }
-
     close(sock);
 }
 
@@ -189,15 +189,13 @@ int main() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(port);
     bind(fd, (sockaddr*)&addr, sizeof(addr));
     listen(fd, 32);
-
-    std::cout << "=== Vityaz Server HTTP sulla porta " << port << " ===\n";
+    std::cout << "=== Vityaz Server sulla porta " << port << " ===\n";
 
     while (true) {
         int client = accept(fd, NULL, NULL);
