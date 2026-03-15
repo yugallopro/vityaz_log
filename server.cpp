@@ -184,6 +184,9 @@ void handleHTTP(int sock) {
         if (!lv.empty()) last = atoi(lv.c_str());
         sendHTTP(sock, "application/json", buildJSON(last));
 
+    } else if (path == "/ping") {
+        sendHTTP(sock, "application/json", "{"status":"ok"}");
+
     } else if (path == "/send" && method == "POST") {
         std::string key  = getParam(query, "key");
         if (key.empty()) key = getParam(body, "key");
