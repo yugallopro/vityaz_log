@@ -5,20 +5,95 @@
 #include <thread>
 #include <mutex>
 #include <sstream>
-#include <fstream>
 #include <cstring>
 #include <ctime>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <sys/stat.h>
+#include <libpq-fe.h>
 
 #define PASSWORD "vityaz2024"
-#define LOG_DIR  "./logs/"
 
 std::mutex g_mutex;
-std::map<std::string, std::vector<std::string>> g_logs;
+std::map<std::string, std::vector<std::string>> g_cache;
+std::string g_dbUrl = "";
+
+// ── Database ─────────────────────────────────────────────────────
+
+PGconn* dbConnect() {
+    return PQconnectdb(g_dbUrl.c_str());
+}
+
+void dbInit() {
+    PGconn* conn = dbConnect();
+    if (PQstatus(conn) != CONNECTION_OK) {
+        std::cerr << "DB errore: " << PQerrorMessage(conn) << "\n";
+        PQfinish(conn);
+        return;
+    }
+    // Crea tabella se non esiste
+    PQexec(conn,
+        "CREATE TABLE IF NOT EXISTS logs ("
+        "  id SERIAL PRIMARY KEY,"
+        "  pc_id TEXT NOT NULL,"
+        "  riga TEXT NOT NULL,"
+        "  ts TIMESTAMP DEFAULT NOW()"
+        ");"
+    );
+    std::cout << "DB connesso e tabella pronta\n";
+    PQfinish(conn);
+}
+
+void dbInsert(const std::string& pcId, const std::string& riga) {
+    PGconn* conn = dbConnect();
+    if (PQstatus(conn) != CONNECTION_OK) { PQfinish(conn); return; }
+    const char* params[2] = { pcId.c_str(), riga.c_str() };
+    PQexecParams(conn,
+        "INSERT INTO logs (pc_id, riga) VALUES ($1, $2)",
+        2, NULL, params, NULL, NULL, 0);
+    PQfinish(conn);
+}
+
+void dbClear(const std::string& pcId) {
+    PGconn* conn = dbConnect();
+    if (PQstatus(conn) != CONNECTION_OK) { PQfinish(conn); return; }
+    const char* params[1] = { pcId.c_str() };
+    PQexecParams(conn, "DELETE FROM logs WHERE pc_id=$1",
+        1, NULL, params, NULL, NULL, 0);
+    PQfinish(conn);
+}
+
+// Carica tutte le righe di un PC dal DB in cache
+void dbLoadPC(const std::string& pcId) {
+    PGconn* conn = dbConnect();
+    if (PQstatus(conn) != CONNECTION_OK) { PQfinish(conn); return; }
+    const char* params[1] = { pcId.c_str() };
+    PGresult* res = PQexecParams(conn,
+        "SELECT riga FROM logs WHERE pc_id=$1 ORDER BY id ASC",
+        1, NULL, params, NULL, NULL, 0);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_cache[pcId].clear();
+    for (int i = 0; i < PQntuples(res); i++)
+        g_cache[pcId].push_back(PQgetvalue(res, i, 0));
+    PQclear(res);
+    PQfinish(conn);
+}
+
+std::vector<std::string> dbGetPCList() {
+    PGconn* conn = dbConnect();
+    std::vector<std::string> list;
+    if (PQstatus(conn) != CONNECTION_OK) { PQfinish(conn); return list; }
+    PGresult* res = PQexec(conn,
+        "SELECT DISTINCT pc_id FROM logs ORDER BY pc_id");
+    for (int i = 0; i < PQntuples(res); i++)
+        list.push_back(PQgetvalue(res, i, 0));
+    PQclear(res);
+    PQfinish(conn);
+    return list;
+}
+
+// ── Utility ──────────────────────────────────────────────────────
 
 std::string timestamp() {
     time_t now = time(0);
@@ -59,17 +134,6 @@ std::string sanitizeId(const std::string& s) {
     return out.empty() ? "pc_default" : out;
 }
 
-void ensureLogDir() { mkdir(LOG_DIR, 0755); }
-
-std::string logPath(const std::string& pcId) {
-    return std::string(LOG_DIR) + pcId + ".txt";
-}
-
-void appendToDisk(const std::string& pcId, const std::string& entry) {
-    std::ofstream f(logPath(pcId), std::ios::app);
-    if (f.is_open()) f << entry << "\n";
-}
-
 std::string escapeJSON(const std::string& s) {
     std::string out;
     for (char c : s) {
@@ -79,6 +143,8 @@ std::string escapeJSON(const std::string& s) {
     }
     return out;
 }
+
+// ── HTML ─────────────────────────────────────────────────────────
 
 std::string buildHTML() {
     std::string h;
@@ -98,6 +164,7 @@ std::string buildHTML() {
     h += "<select id=\"pcSelect\" onchange=\"changePC()\"><option value=\"\">-- seleziona PC --</option></select>";
     h += "<button onclick=\"refreshPCList()\">Aggiorna lista PC</button>";
     h += "<a id=\"dlLink\" href=\"#\" style=\"display:none\"><button>Scarica log</button></a>";
+    h += "<button onclick=\"clearLog()\">Svuota log</button>";
     h += "<span id=\"stato\">-</span>";
     h += "</div>";
     h += "<div id=\"log\"></div>";
@@ -109,10 +176,8 @@ std::string buildHTML() {
     h += "var prev=sel.value;";
     h += "sel.innerHTML='<option value=\"\">-- seleziona PC --</option>';";
     h += "d.pcs.forEach(function(pc){";
-    h += "var o=document.createElement('option');";
-    h += "o.value=pc;o.textContent=pc;";
-    h += "if(pc===prev)o.selected=true;";
-    h += "sel.appendChild(o);});});}";
+    h += "var o=document.createElement('option');o.value=pc;o.textContent=pc;";
+    h += "if(pc===prev)o.selected=true;sel.appendChild(o);});});}";
     h += "function changePC(){";
     h += "var sel=document.getElementById('pcSelect');";
     h += "currentPC=sel.value;last=0;";
@@ -137,18 +202,26 @@ std::string buildHTML() {
     h += ".catch(function(){";
     h += "document.getElementById('stato').textContent='Riconnessione...';";
     h += "pollTimer=setTimeout(poll,3000);});}";
+    h += "function clearLog(){";
+    h += "if(!currentPC){alert('Seleziona prima un PC');return;}";
+    h += "if(!confirm('Svuotare il log di '+currentPC+'?'))return;";
+    h += "fetch('/clear?psw=vityaz2024&pc='+encodeURIComponent(currentPC),{method:'POST'})";
+    h += ".then(function(r){return r.json()})";
+    h += ".then(function(d){if(d.status==='ok'){document.getElementById('log').textContent='';last=0;}});}";
     h += "refreshPCList();";
     h += "</script></body></html>";
     return h;
 }
 
+// ── JSON builders ─────────────────────────────────────────────────
+
 std::string buildPCListJSON() {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    auto list = dbGetPCList();
     std::string out = "{\"pcs\":[";
     bool first = true;
-    for (auto& kv : g_logs) {
+    for (auto& pc : list) {
         if (!first) out += ",";
-        out += "\"" + escapeJSON(kv.first) + "\"";
+        out += "\"" + escapeJSON(pc) + "\"";
         first = false;
     }
     out += "]}";
@@ -156,9 +229,16 @@ std::string buildPCListJSON() {
 }
 
 std::string buildDataJSON(const std::string& pcId, int lastSeen) {
+    // Se la cache e vuota per questo PC, caricala dal DB
+    bool needLoad = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        needLoad = (g_cache.find(pcId) == g_cache.end());
+    }
+    if (needLoad) dbLoadPC(pcId);
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_logs.find(pcId);
-    if (it == g_logs.end()) return "{\"totale\":0,\"righe\":[]}";
+    auto it = g_cache.find(pcId);
+    if (it == g_cache.end()) return "{\"totale\":0,\"righe\":[]}";
     auto& lines = it->second;
     std::ostringstream oss;
     oss << "{\"totale\":" << lines.size() << ",\"righe\":[";
@@ -171,6 +251,8 @@ std::string buildDataJSON(const std::string& pcId, int lastSeen) {
     oss << "]}";
     return oss.str();
 }
+
+// ── HTTP ─────────────────────────────────────────────────────────
 
 std::string readFullRequest(int sock) {
     std::string req;
@@ -238,7 +320,10 @@ void handleHTTP(int sock) {
         int last = 0;
         std::string lv = getParam(query, "last");
         if (!lv.empty()) last = atoi(lv.c_str());
-        sendHTTP(sock, "application/json", buildDataJSON(pc, last));
+        if (!pc.empty())
+            sendHTTP(sock, "application/json", buildDataJSON(pc, last));
+        else
+            sendHTTP(sock, "application/json", "{\"totale\":0,\"righe\":[]}");
 
     } else if (path.find("/download/") == 0) {
         std::string psw = getParam(query, "psw");
@@ -246,12 +331,24 @@ void handleHTTP(int sock) {
             sendHTTP(sock, "application/json", "{\"status\":\"error\"}");
         } else {
             std::string pcId = sanitizeId(path.substr(10));
-            std::ifstream f(logPath(pcId));
+            dbLoadPC(pcId);
+            std::lock_guard<std::mutex> lock(g_mutex);
             std::string content;
-            if (f.is_open()) { std::ostringstream ss2; ss2 << f.rdbuf(); content = ss2.str(); }
-            else content = "(nessun log per " + pcId + ")";
+            for (auto& r : g_cache[pcId]) content += r + "\n";
             std::string disp = "Content-Disposition: attachment; filename=\"" + pcId + ".txt\"\r\n";
             sendHTTP(sock, "text/plain; charset=UTF-8", content, disp);
+        }
+
+    } else if (path == "/clear" && method == "POST") {
+        std::string psw = getParam(query, "psw");
+        std::string pcId = sanitizeId(getParam(query, "pc"));
+        if (psw != PASSWORD || pcId.empty()) {
+            sendHTTP(sock, "application/json", "{\"status\":\"error\"}");
+        } else {
+            dbClear(pcId);
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_cache[pcId].clear();
+            sendHTTP(sock, "application/json", "{\"status\":\"ok\"}");
         }
 
     } else if (path == "/send" && method == "POST") {
@@ -268,8 +365,11 @@ void handleHTTP(int sock) {
             sendHTTP(sock, "application/json", "{\"status\":\"error\",\"msg\":\"riga vuota\"}");
         } else {
             std::string entry = timestamp() + " " + riga;
-            { std::lock_guard<std::mutex> lock(g_mutex); g_logs[pcId].push_back(entry); }
-            appendToDisk(pcId, entry);
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_cache[pcId].push_back(entry);
+            }
+            dbInsert(pcId, entry);
             std::cout << "[" << pcId << "] " << entry << "\n";
             sendHTTP(sock, "application/json", "{\"status\":\"ok\"}");
         }
@@ -280,10 +380,19 @@ void handleHTTP(int sock) {
 }
 
 int main() {
-    ensureLogDir();
+    // Leggi URL database dalla variabile d'ambiente
+    const char* dbUrl = getenv("DATABASE_URL");
+    if (!dbUrl) {
+        std::cerr << "ERRORE: variabile DATABASE_URL non impostata\n";
+        return 1;
+    }
+    g_dbUrl = std::string(dbUrl);
+    dbInit();
+
     int port = 8080;
     const char* envPort = getenv("PORT");
     if (envPort) port = atoi(envPort);
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -294,6 +403,7 @@ int main() {
     bind(fd, (sockaddr*)&addr, sizeof(addr));
     listen(fd, 32);
     std::cout << "=== Vityaz Server porta " << port << " ===\n";
+
     while (true) {
         int client = accept(fd, NULL, NULL);
         if (client >= 0) std::thread(handleHTTP, client).detach();
