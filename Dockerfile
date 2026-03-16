@@ -1,9 +1,10 @@
-FROM debian:bookworm
+FROM ubuntu:22.04
 
-RUN apt-get update && apt-get install -y \
-    g++ \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -y && \
+    apt-get install -y g++ libpq-dev && \
+    apt-get clean
 
 WORKDIR /app
 COPY server.cpp .
