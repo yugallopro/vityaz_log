@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Vityaz Monitor</title>
+<style>
+body{background:#0a0a0a;color:#00ff41;font-family:monospace;padding:20px;margin:0}
+h2{letter-spacing:4px;border-bottom:1px solid #00ff41;padding-bottom:8px}
+#controls{display:flex;align-items:center;gap:16px;margin:12px 0;flex-wrap:wrap}
+select{background:#111;color:#00ff41;border:1px solid #00ff41;padding:6px 12px;font-family:monospace;font-size:14px;cursor:pointer}
+button{background:#001a00;color:#00ff41;border:1px solid #00ff41;padding:6px 14px;font-family:monospace;cursor:pointer;font-size:13px}
+button:hover{background:#003300}
+#stato{font-size:12px;color:#555}
+#log{white-space:pre-wrap;font-size:14px;line-height:1.8;margin-top:12px}
+</style>
+</head>
+<body>
+<h2>VITYAZ MONITOR</h2>
+<div id="controls">
+  <select id="pcSelect" onchange="changePC()"><option value="">-- seleziona PC --</option></select>
+  <button onclick="refreshPCList()">Aggiorna lista PC</button>
+  <button onclick="downloadLog()">Scarica log</button>
+  <button onclick="clearLog()">Svuota log</button>
+  <span id="stato">-</span>
+</div>
+<div id="log"></div>
+
+<script>
+var SUPABASE_URL = "https://zyhvckzlwdoxubcgluzr.supabase.co";
+var SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5aHZja3psd2RveHViY2dsdXpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1ODU3NDYsImV4cCI6MjA4OTE2MTc0Nn0.ifTRzNwSDO3vFKxnJmpx2CPtQprbB7gBuEz85h7mLKQ";
+
+var currentPC = "", lastId = 0, pollTimer = null;
+
+function sbFetch(path, options) {
+    options = options || {};
+    options.headers = options.headers || {};
+    options.headers["apikey"] = SUPABASE_KEY;
+    options.headers["Authorization"] = "Bearer " + SUPABASE_KEY;
+    options.headers["Content-Type"] = "application/json";
+    return fetch(SUPABASE_URL + path, options);
+}
+
+function refreshPCList() {
+    sbFetch("/rest/v1/logs?select=pc_id&order=pc_id.asc")
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+        var seen = {}, pcs = [];
+        d.forEach(function(row){ if(!seen[row.pc_id]){ seen[row.pc_id]=1; pcs.push(row.pc_id); } });
+        var sel = document.getElementById("pcSelect");
+        var prev = sel.value;
+        sel.innerHTML = "<option value=''>-- seleziona PC --</option>";
+        pcs.forEach(function(pc){
+            var o = document.createElement("option");
+            o.value = pc; o.textContent = pc;
+            if (pc === prev) o.selected = true;
+            sel.appendChild(o);
+        });
+    });
+}
+
+function changePC() {
+    currentPC = document.getElementById("pcSelect").value;
+    lastId = 0;
+    document.getElementById("log").textContent = "";
+    document.getElementById("stato").textContent = currentPC ? "Caricamento..." : "-";
+    if (pollTimer) clearTimeout(pollTimer);
+    if (currentPC) poll();
+}
+
+function poll() {
+    if (!currentPC) return;
+    // Legge solo le righe con id > lastId
+    var url = "/rest/v1/logs?pc_id=eq." + encodeURIComponent(currentPC)
+            + "&id=gt." + lastId
+            + "&order=id.asc&select=id,riga";
+    sbFetch(url)
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+        if (d && d.length > 0) {
+            var log = document.getElementById("log");
+            d.forEach(function(row){
+                log.textContent += row.riga + "\n";
+                lastId = row.id;
+            });
+            window.scrollTo(0, document.body.scrollHeight);
+        }
+        document.getElementById("stato").textContent = "LIVE [" + currentPC + "] ultimo id: " + lastId;
+        pollTimer = setTimeout(poll, 2000);
+    })
+    .catch(function(){
+        document.getElementById("stato").textContent = "Errore, riprovo...";
+        pollTimer = setTimeout(poll, 3000);
+    });
+}
+
+function downloadLog() {
+    if (!currentPC) { alert("Seleziona prima un PC"); return; }
+    sbFetch("/rest/v1/logs?pc_id=eq." + encodeURIComponent(currentPC) + "&order=id.asc&select=riga")
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+        var text = d.map(function(r){ return r.riga; }).join("\n");
+        var blob = new Blob([text], {type:"text/plain"});
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = currentPC + ".txt";
+        a.click();
+    });
+}
+
+function clearLog() {
+    if (!currentPC) { alert("Seleziona prima un PC"); return; }
+    if (!confirm("Svuotare il log di " + currentPC + "?")) return;
+    sbFetch("/rest/v1/logs?pc_id=eq." + encodeURIComponent(currentPC), { method: "DELETE" })
+    .then(function(){
+        document.getElementById("log").textContent = "";
+        lastId = 0;
+        document.getElementById("stato").textContent = "Log svuotato";
+    });
+}
+
+refreshPCList();
+</script>
+</body>
+</html>
