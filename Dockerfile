@@ -1,6 +1,6 @@
 FROM gcc:13
 
-RUN apt-get update && apt-get install -y libpq-dev
+RUN apt-get update && apt-get install -y libpq-dev postgresql-client
 
 WORKDIR /app
 COPY server.cpp .
