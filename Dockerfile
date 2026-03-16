@@ -1,6 +1,9 @@
-FROM gcc:13
+FROM debian:bookworm
 
-RUN apt-get update && apt-get install -y libpq-dev postgresql-client
+RUN apt-get update && apt-get install -y \
+    g++ \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY server.cpp .
